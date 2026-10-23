@@ -20,6 +20,20 @@
 #include "driveclub/launcher.h"
 #include "driveclub/widescreen.h"
 
+#ifndef _WIN32
+#include <bit>
+#include <cfloat>
+#include <cstdio>
+#include <mutex>
+
+#include <SDL3/SDL.h>
+#include <imgui.h>
+
+#include "imgui/big_picture/imgui_impl_sdl3_big_picture.h"
+#include "imgui/big_picture/imgui_impl_sdlrenderer3.h"
+#include "imgui/renderer/font_stack.h"
+#endif
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -161,6 +175,18 @@ std::pair<int, int> DisplaySize() {
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth > 0) {
         width = static_cast<int>(mode.dmPelsWidth);
         height = static_cast<int>(mode.dmPelsHeight);
+    }
+#else
+    // driveclub-pc (linux): the desktop size of the primary display, through SDL.
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+        if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display)) {
+            if (mode->w > 0 && mode->h > 0) {
+                width = mode->w;
+                height = mode->h;
+            }
+        }
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
 #endif
     return {width, height};
@@ -998,6 +1024,386 @@ bool ShowWindow(Settings& s) {
 
 } // namespace
 
+#ifndef _WIN32
+
+// driveclub-pc (linux): the settings window, drawn with SDL3 + Dear ImGui (the same stack as the
+// Big Picture mode). It mirrors the Windows window: game folder, firmware import, frame rate,
+// display, render resolution, upscaling, image quality and the runtime options.
+namespace {
+
+struct FolderPick {
+    std::mutex mutex;
+    bool finished = false;
+    bool has_path = false;
+    std::string path;
+};
+
+// SDL calls this from another thread when the folder dialog closes.
+void SDLCALL OnFolderPicked(void* userdata, const char* const* list, int /*filter*/) {
+    auto* pick = static_cast<FolderPick*>(userdata);
+    std::lock_guard lock{pick->mutex};
+    if (list != nullptr && list[0] != nullptr) {
+        pick->path = list[0];
+        pick->has_path = true;
+    }
+    pick->finished = true;
+}
+
+std::string ImportFirmwareFrom(const fs::path& source) {
+    const fs::path dest = EmulatorSettings.GetSysModulesDir();
+    std::error_code ec;
+    fs::create_directories(dest, ec);
+    int copied = 0;
+    for (const auto& entry : fs::directory_iterator(source, ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".sprx") {
+            std::error_code copy_ec;
+            fs::copy_file(entry.path(), dest / entry.path().filename(),
+                          fs::copy_options::skip_existing, copy_ec);
+            copied += copy_ec ? 0 : 1;
+        }
+    }
+    return fmt::format("Copied {} module(s) into {}", copied, dest.string());
+}
+
+} // namespace
+
+static bool ShowWindowImGui(Settings& s) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        ShowError(fmt::format("Cannot open the settings window ({}).\nEdit user/driveclub_pc.ini "
+                              "instead.",
+                              SDL_GetError()));
+        return false;
+    }
+    SDL_Window* window = SDL_CreateWindow("Driveclub-PC", 820, 940, SDL_WINDOW_RESIZABLE);
+    SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+    if (window == nullptr || renderer == nullptr) {
+        const std::string reason = SDL_GetError();
+        if (renderer != nullptr) {
+            SDL_DestroyRenderer(renderer);
+        }
+        if (window != nullptr) {
+            SDL_DestroyWindow(window);
+        }
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        ShowError(fmt::format("Cannot open the settings window ({}).\nEdit user/driveclub_pc.ini "
+                              "instead.",
+                              reason));
+        return false;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // no imgui.ini in the working directory
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImFontConfig font_cfg;
+    font_cfg.OversampleH = 2;
+    font_cfg.OversampleV = 1;
+    io.FontDefault = ImGui::FontStack::AddPrimaryUiFont(
+        io.Fonts, 32.0f, EmulatorSettings.GetConsoleLanguage(), font_cfg, false);
+    io.FontGlobalScale = 0.5f;
+    const auto max_dim = SDL_GetNumberProperty(SDL_GetRendererProperties(renderer),
+                                               SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 8192);
+    const int atlas_max = static_cast<int>(std::bit_floor(std::max<u64>(max_dim, 512)));
+    io.Fonts->TexMaxWidth = atlas_max;
+    io.Fonts->TexMaxHeight = atlas_max;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 4.0f;
+    style.WindowRounding = 0.0f;
+    style.ItemSpacing = ImVec2(8.0f, 9.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer3_Init(renderer);
+
+    // ---- state -------------------------------------------------------------------------------
+    static FolderPick pick; // static: the SDL dialog may call back after this function returns
+    int pick_target = 0;    // 0 = game folder, 1 = firmware folder
+    bool pick_pending = false;
+
+    char game_buf[2048]{};
+    std::snprintf(game_buf, sizeof(game_buf), "%s", s.game_dir.c_str());
+    bool game_ok = false;
+    bool firmware_ok = false;
+    std::string game_msg;
+    std::string fw_msg;
+    std::string notice;
+
+    const auto refresh = [&] {
+        const std::string dir = game_buf;
+        if (dir.empty()) {
+            game_ok = false;
+            game_msg = "Choose the Driveclub base game folder (CUSA00093).";
+        } else {
+            std::string error;
+            const auto eboot = ResolveAndValidateGame(dir, error);
+            game_ok = eboot.has_value();
+            game_msg = game_ok ? "Driveclub found." : error;
+        }
+        fw_msg = FirmwareStatus(firmware_ok);
+        std::replace(game_msg.begin(), game_msg.end(), '\n', ' ');
+        std::replace(fw_msg.begin(), fw_msg.end(), '\n', ' ');
+    };
+    refresh();
+
+    const auto [display_w, display_h] = DisplaySize();
+    const std::vector<std::pair<int, int>> resolutions = {
+        {0, 0},       {5120, 1440}, {3840, 2160}, {3440, 1440}, {2560, 1600}, {2560, 1440},
+        {2560, 1080}, {1920, 1200}, {1920, 1080}, {1600, 900},  {1280, 720}};
+    std::vector<std::string> res_items;
+    int res_i = 0;
+    for (size_t i = 0; i < resolutions.size(); ++i) {
+        const auto [w, h] = resolutions[i];
+        res_items.push_back(i == 0 ? fmt::format("Same as the display ({}x{})", display_w,
+                                                 display_h)
+                                   : fmt::format("{}x{}", w, h));
+        if (w == s.width && h == s.height) {
+            res_i = static_cast<int>(i);
+        }
+    }
+    const std::vector<std::string> fps_items = {"30 FPS (as on PS4)", "60 FPS (recommended)",
+                                                "120 FPS (experimental)"};
+    const std::vector<std::string> display_items = {"Fullscreen (borderless)", "Window"};
+    const std::vector<std::string> render_items = {"1080p (native, fastest)",
+                                                   "1440p (sharper, about 10-15% slower)",
+                                                   "2160p (very demanding)"};
+    const std::vector<std::string> upscale_items = {"AMD FSR 1 (game image to window size)",
+                                                    "Bilinear"};
+    const std::vector<std::string> sharp_items = {"Off", "Normal (RCAS)", "Strong (RCAS)"};
+    const std::vector<std::string> af_items = {"Off (game setting)", "2x", "4x", "8x", "16x"};
+    const std::vector<std::string> aa_items = {"Off", "FXAA (default)", "SMAA 1x (High)"};
+    const std::vector<std::string> rb_items = {"Precise (default)",
+                                               "Relaxed (faster, shadow/vegetation glitches)",
+                                               "Off (fastest, effects may break)"};
+
+    int fps_i = s.target_fps == 30 ? 0 : s.target_fps == 120 ? 2 : 1;
+    int display_i = s.fullscreen ? 0 : 1;
+    int render_i = s.render_res == 2160 ? 2 : s.render_res == 1440 ? 1 : 0;
+    int upscale_i = s.fsr ? 0 : 1;
+    int sharp_i = std::clamp(s.sharpening, 0, 2);
+    int af_i = s.af == 16 ? 4 : s.af == 8 ? 3 : s.af == 4 ? 2 : s.af == 2 ? 1 : 0;
+    int aa_i = std::clamp(s.aa, 0, 2);
+    int rb_i = 2 - std::clamp(s.readbacks, 0, 2);
+    bool pcore = s.pcore_pin;
+    bool async_shaders = s.async_shaders;
+    bool show_fps = s.show_fps;
+    bool deferred = s.deferred_recording;
+    bool classic = s.classic_vblank;
+    bool show_launcher = s.show_launcher;
+
+    constexpr float label_w = 170.0f;
+    const ImVec4 green(0.35f, 0.80f, 0.45f, 1.0f);
+    const ImVec4 red(0.95f, 0.40f, 0.40f, 1.0f);
+
+    const auto combo = [&](const char* label, const char* id, int& index,
+                           const std::vector<std::string>& items) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(label_w);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo(id, items[static_cast<size_t>(index)].c_str())) {
+            for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+                const bool selected = i == index;
+                if (ImGui::Selectable(items[static_cast<size_t>(i)].c_str(), selected)) {
+                    index = i;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    const auto check = [&](const char* label, bool& value) {
+        ImGui::SetCursorPosX(label_w);
+        ImGui::Checkbox(label, &value);
+    };
+    const auto status = [&](const std::string& message, bool ok) {
+        ImGui::Indent(label_w);
+        ImGui::PushStyleColor(ImGuiCol_Text, ok ? green : red);
+        ImGui::TextWrapped("%s", message.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent(label_w);
+    };
+    const auto start_pick = [&](int target) {
+        pick_target = target;
+        pick_pending = true;
+        {
+            std::lock_guard lock{pick.mutex};
+            pick.finished = false;
+            pick.has_path = false;
+            pick.path.clear();
+        }
+        SDL_ShowOpenFolderDialog(OnFolderPicked, &pick, window, nullptr, false);
+    };
+
+    // ---- main loop ---------------------------------------------------------------------------
+    bool done = false;
+    bool play = false;
+    while (!done) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL3_ProcessEvent(&event);
+            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                done = true;
+            }
+        }
+
+        if (pick_pending) {
+            bool finished = false;
+            bool has_path = false;
+            std::string picked;
+            {
+                std::lock_guard lock{pick.mutex};
+                finished = pick.finished;
+                has_path = pick.has_path;
+                picked = pick.path;
+            }
+            if (finished) {
+                pick_pending = false;
+                if (has_path) {
+                    if (pick_target == 0) {
+                        std::snprintf(game_buf, sizeof(game_buf), "%s", picked.c_str());
+                        notice.clear();
+                    } else {
+                        notice = ImportFirmwareFrom(picked);
+                    }
+                    refresh();
+                }
+            }
+        }
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::Begin("Driveclub-PC", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoSavedSettings);
+
+        ImGui::TextUnformatted("Driveclub-PC settings");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Game folder
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Game folder");
+        ImGui::SameLine(label_w);
+        ImGui::SetNextItemWidth(-110.0f);
+        ImGui::InputText("##game", game_buf, sizeof(game_buf));
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            refresh();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(pick_pending);
+        if (ImGui::Button("Browse...##game")) {
+            start_pick(0);
+        }
+        ImGui::EndDisabled();
+        status(game_msg, game_ok);
+        ImGui::Spacing();
+
+        // Firmware
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Firmware");
+        ImGui::SameLine(label_w);
+        ImGui::BeginDisabled(pick_pending);
+        if (ImGui::Button("Import...##fw")) {
+            start_pick(1);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(folder with your PS4 *.sprx modules)");
+        status(fw_msg, firmware_ok);
+        if (!notice.empty()) {
+            ImGui::Indent(label_w);
+            ImGui::TextWrapped("%s", notice.c_str());
+            ImGui::Unindent(label_w);
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        combo("Frame rate", "##fps", fps_i, fps_items);
+        combo("Display", "##display", display_i, display_items);
+        ImGui::BeginDisabled(display_i == 0); // the window size only applies in windowed mode
+        combo("Window size", "##resolution", res_i, res_items);
+        ImGui::EndDisabled();
+        combo("Render resolution", "##render", render_i, render_items);
+        combo("Upscaling", "##upscale", upscale_i, upscale_items);
+        combo("Sharpening", "##sharp", sharp_i, sharp_items);
+        combo("Anisotropic filter", "##af", af_i, af_items);
+        combo("Anti-aliasing", "##aa", aa_i, aa_items);
+        combo("GPU readbacks", "##readbacks", rb_i, rb_items);
+        ImGui::Spacing();
+
+        check("Prefer performance cores (hybrid CPUs)", pcore);
+        check("Compile shaders in the background (less stutter)", async_shaders);
+        check("Show FPS counter", show_fps);
+        check("Experimental: record Vulkan commands on a second thread", deferred);
+        check("Classic PS4 frame pacing (fallback if timing looks wrong)", classic);
+        check("Show this window at start", show_launcher);
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::SetCursorPosX(label_w);
+        ImGui::BeginDisabled(!(game_ok && firmware_ok));
+        if (ImGui::Button("Play", ImVec2(120.0f, 0.0f))) {
+            play = true;
+            done = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Quit", ImVec2(120.0f, 0.0f))) {
+            done = true;
+        }
+
+        ImGui::End();
+        ImGui::Render();
+        SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+        SDL_RenderClear(renderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+        SDL_RenderPresent(renderer);
+    }
+
+    // ---- collect the choices (also when the window is closed, so the ini keeps them) --------
+    s.game_dir = game_buf;
+    static constexpr int fps_values[] = {30, 60, 120};
+    s.target_fps = fps_values[std::clamp(fps_i, 0, 2)];
+    s.fullscreen = display_i == 0;
+    const auto [chosen_w, chosen_h] = resolutions[static_cast<size_t>(res_i)];
+    s.width = chosen_w;
+    s.height = chosen_h;
+    s.fsr = upscale_i == 0;
+    s.sharpening = std::clamp(sharp_i, 0, 2);
+    s.readbacks = 2 - std::clamp(rb_i, 0, 2);
+    static constexpr int af_values[] = {0, 2, 4, 8, 16};
+    s.af = af_values[std::clamp(af_i, 0, 4)];
+    s.aa = std::clamp(aa_i, 0, 2);
+    static constexpr int render_values[] = {1080, 1440, 2160};
+    s.render_res = render_values[std::clamp(render_i, 0, 2)];
+    s.pcore_pin = pcore;
+    s.async_shaders = async_shaders;
+    s.show_fps = show_fps;
+    s.deferred_recording = deferred;
+    s.classic_vblank = classic;
+    s.show_launcher = show_launcher;
+
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return play;
+}
+
+#endif // !_WIN32
+
 std::optional<fs::path> Run() {
     Settings s = Load();
     std::string error;
@@ -1015,9 +1421,13 @@ std::optional<fs::path> Run() {
         }
     }
 #else
-    if (!game_ok || !firmware_ok) {
-        ShowError(error.empty() ? std::string("Set game_dir in user/driveclub_pc.ini") : error);
-        return std::nullopt;
+    // driveclub-pc (linux): DCPC_LAUNCHER=1 opens the window even when it is turned off.
+    if (s.show_launcher || !game_ok || !firmware_ok || std::getenv("DCPC_LAUNCHER") != nullptr) {
+        const bool play = ShowWindowImGui(s);
+        Save(s);
+        if (!play) {
+            return std::nullopt;
+        }
     }
 #endif
     if (!PrepareSaveRoot(s, error)) {

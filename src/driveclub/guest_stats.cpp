@@ -12,7 +12,11 @@
 #include <vector>
 
 #include <fmt/format.h>
+#ifdef _MSC_VER
 #include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
