@@ -163,10 +163,13 @@ std::optional<std::filesystem::path> ResolveAndValidateGame(const std::filesyste
     if (*title_id != TitleId) {
         LOG_WARNING(Loader, "{}", GameCompatibilityNote(*title_id));
     }
-    if (update_version != TargetAppVersion) {
+    // The installed version is the update's when there is an update folder, otherwise the base
+    // game's (a dump that already is 1.28 needs no separate update folder).
+    const auto installed_version = update ? update_version : base_version;
+    if (installed_version != TargetAppVersion) {
         LOG_WARNING(Loader,
                     "{}: tested with update {}; this installation runs {}. Expect differences.",
-                    AppName, TargetAppVersion, update ? update_version : base_version);
+                    AppName, TargetAppVersion, installed_version);
     }
     return eboot;
 }

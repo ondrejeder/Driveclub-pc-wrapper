@@ -3,9 +3,20 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 # Driveclub-PC
 
-A personal hobby fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PS4 emulator, tuned
-to run **Driveclub (CUSA00093, v1.28)** on Windows. It is built on
-[GR2fork](https://github.com/junminlee2004/GR2fork) by junminlee2004.
+A personal hobby fork of the shadPS4 PS4 emulator, tuned
+to run Driveclub (CUSA00093, v1.28) on Windows. It is built on
+GR2fork by junminlee2004.
+
+This fork was created to help bring this project and build to Linux users.
+
+    Game log files on this build are located at log/shad_log.txt and log/shadps4.log (instead of log/CUSA00093.log).
+
+    Save data is located at ~/.local/share/shadPS4/home/1000/savedata/CUSA00093, containing PROFILE, GHOSTS, and REPLAYS.
+
+    Per-game overrides go to ~/.local/share/shadPS4/custom_configs/CUSA00093.json.
+    thanks to @dougbug589
+
+As I do not have a formal programming background, contributions from experienced developers are very welcome. If you would like to fix issues, improve Linux compatibility, or continue maintaining this version, feel free to submit Pull Requests or create your own fork.
 
 **No game data, firmware or Sony code is included.** You need your own dump of Driveclub
 (base game plus the 1.28 update) and the PS4 system modules from your own console.

@@ -20,6 +20,25 @@
 #include "driveclub/launcher.h"
 #include "driveclub/widescreen.h"
 
+#ifndef _WIN32
+#include <bit>
+#include <cfloat>
+#include <cstdio>
+#include <fstream>
+#include <mutex>
+#include <set>
+#include <tuple>
+
+#include <SDL3/SDL.h>
+#include <imgui.h>
+#include <nlohmann/json.hpp>
+#include <pugixml.hpp>
+
+#include "imgui/big_picture/imgui_impl_sdl3_big_picture.h"
+#include "imgui/big_picture/imgui_impl_sdlrenderer3.h"
+#include "imgui/renderer/font_stack.h"
+#endif
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -161,6 +180,18 @@ std::pair<int, int> DisplaySize() {
     if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth > 0) {
         width = static_cast<int>(mode.dmPelsWidth);
         height = static_cast<int>(mode.dmPelsHeight);
+    }
+#else
+    // driveclub-pc (linux): the desktop size of the primary display, through SDL.
+    if (SDL_Init(SDL_INIT_VIDEO)) {
+        const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+        if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(display)) {
+            if (mode->w > 0 && mode->h > 0) {
+                width = mode->w;
+                height = mode->h;
+            }
+        }
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
 #endif
     return {width, height};
@@ -998,6 +1029,802 @@ bool ShowWindow(Settings& s) {
 
 } // namespace
 
+#ifndef _WIN32
+
+// driveclub-pc (linux): the settings window, drawn with SDL3 + Dear ImGui (the same stack as the
+// Big Picture mode). It mirrors the Windows window: game folder, firmware import, frame rate,
+// display, render resolution, upscaling, image quality and the runtime options.
+namespace {
+
+struct FolderPick {
+    std::mutex mutex;
+    bool finished = false;
+    bool has_path = false;
+    std::string path;
+};
+
+// SDL calls this from another thread when the folder dialog closes.
+void SDLCALL OnFolderPicked(void* userdata, const char* const* list, int /*filter*/) {
+    auto* pick = static_cast<FolderPick*>(userdata);
+    std::lock_guard lock{pick->mutex};
+    if (list != nullptr && list[0] != nullptr) {
+        pick->path = list[0];
+        pick->has_path = true;
+    }
+    pick->finished = true;
+}
+
+std::string ImportFirmwareFrom(const fs::path& source) {
+    const fs::path dest = EmulatorSettings.GetSysModulesDir();
+    std::error_code ec;
+    fs::create_directories(dest, ec);
+    int copied = 0;
+    for (const auto& entry : fs::directory_iterator(source, ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".sprx") {
+            std::error_code copy_ec;
+            fs::copy_file(entry.path(), dest / entry.path().filename(),
+                          fs::copy_options::skip_existing, copy_ec);
+            copied += copy_ec ? 0 : 1;
+        }
+    }
+    return fmt::format("Copied {} module(s) into {}", copied, dest.string());
+}
+
+} // namespace
+
+namespace {
+
+// ---- game patches: list them, switch them on and off, save (like the Patches tab of shadPS4) -----
+// A patch folder (for example ~/.local/share/shadPS4/patches/shadPS4/) holds a files.json that maps
+// each XML file to the title ids it is for, plus the XML files. The emulator applies the patches
+// whose <Metadata> has isEnabled="true"; this part only edits that attribute.
+struct PatchEntry {
+    std::string name;
+    std::string note;
+    bool enabled = false;
+    bool locked = false; // Always="true": not meant to be switched by the user
+};
+
+struct PatchFileInfo {
+    fs::path path;     // the XML file
+    std::string file;  // file name, for example Driveclub.xml
+    std::string repo;  // folder name, for example shadPS4
+};
+
+std::vector<PatchFileInfo> FindPatchFiles(const fs::path& patches_dir,
+                                          const std::set<std::string>& title_ids) {
+    std::vector<PatchFileInfo> result;
+    std::error_code ec;
+    for (const auto& repo : fs::directory_iterator(patches_dir, ec)) {
+        if (!repo.is_directory(ec)) {
+            continue;
+        }
+        std::ifstream index(repo.path() / "files.json");
+        if (!index) {
+            continue;
+        }
+        const auto json = nlohmann::json::parse(index, nullptr, false);
+        if (json.is_discarded() || !json.is_object()) {
+            continue;
+        }
+        for (const auto& [file, serials] : json.items()) {
+            if (!serials.is_array()) {
+                continue;
+            }
+            const bool match = std::any_of(serials.begin(), serials.end(), [&](const auto& id) {
+                return id.is_string() && title_ids.count(id.template get<std::string>()) > 0;
+            });
+            const fs::path xml = repo.path() / file;
+            if (match && fs::is_regular_file(xml, ec)) {
+                result.push_back({xml, file, repo.path().filename().string()});
+            }
+        }
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.repo, a.file) < std::tie(b.repo, b.file);
+    });
+    return result;
+}
+
+std::vector<PatchEntry> ReadPatchEntries(const fs::path& xml_path) {
+    std::vector<PatchEntry> entries;
+    pugi::xml_document doc;
+    if (!doc.load_file(xml_path.c_str())) {
+        return entries;
+    }
+    for (const pugi::xml_node meta : doc.child("Patch").children("Metadata")) {
+        PatchEntry entry;
+        entry.name = meta.attribute("Name").as_string();
+        entry.note = meta.attribute("Note").as_string();
+        entry.enabled = std::string_view(meta.attribute("isEnabled").as_string()) == "true";
+        entry.locked = std::string_view(meta.attribute("Always").as_string()) == "true";
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+bool SavePatchEntries(const fs::path& xml_path, const std::vector<PatchEntry>& entries,
+                      std::string& error) {
+    pugi::xml_document doc;
+    if (!doc.load_file(xml_path.c_str(), pugi::parse_full)) {
+        error = "Cannot read " + xml_path.string();
+        return false;
+    }
+    size_t index = 0;
+    for (pugi::xml_node meta : doc.child("Patch").children("Metadata")) {
+        if (index >= entries.size()) {
+            break;
+        }
+        if (!entries[index].locked) {
+            pugi::xml_attribute attribute = meta.attribute("isEnabled");
+            if (!attribute) {
+                attribute = meta.append_attribute("isEnabled");
+            }
+            attribute.set_value(entries[index].enabled ? "true" : "false");
+        }
+        ++index;
+    }
+    const fs::path temp = xml_path.string() + ".tmp";
+    if (!doc.save_file(temp.c_str(), "    ")) {
+        error = "Cannot write " + temp.string();
+        return false;
+    }
+    std::error_code ec;
+    fs::rename(temp, xml_path, ec);
+    if (ec) {
+        error = "Cannot replace " + xml_path.string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+bool DeletePatchFile(const PatchFileInfo& info, std::string& error) {
+    std::error_code ec;
+    fs::remove(info.path, ec);
+    if (ec) {
+        error = "Cannot delete " + info.path.string() + ": " + ec.message();
+        return false;
+    }
+    const fs::path index_path = info.path.parent_path() / "files.json";
+    nlohmann::json json;
+    {
+        std::ifstream in(index_path);
+        if (in) {
+            json = nlohmann::json::parse(in, nullptr, false);
+        }
+    }
+    if (json.is_object()) {
+        json.erase(info.file);
+        std::ofstream out(index_path);
+        out << json.dump(2) << "\n";
+    }
+    return true;
+}
+
+// Patches shipped inside the AppImage live in <APPDIR>/usr/share/driveclub-pc/patches.
+fs::path BundledPatchesDir() {
+    if (const char* custom = std::getenv("DCPC_BUNDLED_PATCHES"); custom != nullptr && *custom) {
+        return fs::path(custom);
+    }
+    if (const char* appdir = std::getenv("APPDIR"); appdir != nullptr && *appdir) {
+        return fs::path(appdir) / "usr" / "share" / "driveclub-pc" / "patches";
+    }
+    return {};
+}
+
+// Copies the bundled patch files into the user's patches folder once. A file is never overwritten
+// (the user may have switched patches on or off in it) and a file the user deleted does not come
+// back: what was already copied is remembered in .dcpc-seeded.json.
+void SeedBundledPatches(const fs::path& bundled, const fs::path& patches_dir) {
+    std::error_code ec;
+    if (bundled.empty() || !fs::is_directory(bundled, ec)) {
+        return;
+    }
+    fs::create_directories(patches_dir, ec);
+    const fs::path seeded_path = patches_dir / ".dcpc-seeded.json";
+    std::set<std::string> seeded;
+    {
+        std::ifstream in(seeded_path);
+        const auto json = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json();
+        if (json.is_array()) {
+            for (const auto& item : json) {
+                if (item.is_string()) {
+                    seeded.insert(item.get<std::string>());
+                }
+            }
+        }
+    }
+    bool seeded_changed = false;
+    for (const auto& repo : fs::directory_iterator(bundled, ec)) {
+        if (!repo.is_directory(ec)) {
+            continue;
+        }
+        const std::string repo_name = repo.path().filename().string();
+        nlohmann::json bundled_index = nlohmann::json::object();
+        {
+            std::ifstream in(repo.path() / "files.json");
+            const auto json = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json();
+            if (json.is_object()) {
+                bundled_index = json;
+            }
+        }
+        const fs::path dest = patches_dir / repo.path().filename();
+        const fs::path dest_index_path = dest / "files.json";
+        nlohmann::json dest_index = nlohmann::json::object();
+        {
+            std::ifstream in(dest_index_path);
+            const auto json = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json();
+            if (json.is_object()) {
+                dest_index = json;
+            }
+        }
+        bool index_changed = false;
+        for (const auto& item : fs::directory_iterator(repo.path(), ec)) {
+            const std::string file = item.path().filename().string();
+            const std::string key = repo_name + "/" + file;
+            if (!item.is_regular_file(ec) || file == "files.json" || seeded.count(key) > 0) {
+                continue;
+            }
+            fs::create_directories(dest, ec);
+            if (!fs::exists(dest / file, ec)) {
+                fs::copy_file(item.path(), dest / file, ec);
+            }
+            if (bundled_index.contains(file) && !dest_index.contains(file)) {
+                dest_index[file] = bundled_index[file];
+                index_changed = true;
+            }
+            seeded.insert(key);
+            seeded_changed = true;
+        }
+        if (index_changed) {
+            std::ofstream out(dest_index_path);
+            out << dest_index.dump(2) << "\n";
+        }
+    }
+    if (seeded_changed) {
+        std::ofstream out(seeded_path);
+        out << nlohmann::json(seeded).dump(2) << "\n";
+    }
+}
+
+struct PatchPanelState {
+    fs::path dir;
+    std::set<std::string> title_ids;
+    std::vector<PatchFileInfo> files;
+    int selected = -1;
+    std::vector<PatchEntry> entries;
+    bool dirty = false;
+    bool confirm_delete = false;
+    std::string message;
+
+    void Select(int index) {
+        selected = index;
+        dirty = false;
+        confirm_delete = false;
+        entries = (index >= 0 && index < static_cast<int>(files.size()))
+                      ? ReadPatchEntries(files[static_cast<size_t>(index)].path)
+                      : std::vector<PatchEntry>{};
+    }
+
+    void Refresh() {
+        const fs::path previous = (selected >= 0 && selected < static_cast<int>(files.size()))
+                                      ? files[static_cast<size_t>(selected)].path
+                                      : fs::path();
+        files = FindPatchFiles(dir, title_ids);
+        int index = files.empty() ? -1 : 0;
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (files[i].path == previous) {
+                index = static_cast<int>(i);
+            }
+        }
+        Select(index);
+    }
+};
+
+// Draws the patches panel; call it inside a child window that has the room for it.
+void DrawPatchPanel(PatchPanelState& state) {
+    ImGui::TextUnformatted("Game patches");
+    ImGui::Separator();
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("This build already has its own 60 FPS, widescreen and render resolution "
+                        "options. Patches that do the same can conflict with them.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Patch file");
+    if (ImGui::BeginListBox("##patchfiles",
+                            ImVec2(-FLT_MIN, ImGui::GetTextLineHeightWithSpacing() * 4.5f))) {
+        for (int i = 0; i < static_cast<int>(state.files.size()); ++i) {
+            const auto& info = state.files[static_cast<size_t>(i)];
+            const std::string label = info.file + " | " + info.repo;
+            if (ImGui::Selectable(label.c_str(), i == state.selected) && i != state.selected) {
+                state.Select(i);
+            }
+        }
+        ImGui::EndListBox();
+    }
+    if (state.files.empty()) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("No patch files found in %s. Put a patch folder there (a files.json "
+                            "and the XML files), or use the patches bundled with the AppImage.",
+                            state.dir.string().c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Spacing();
+
+    const float below = ImGui::GetFrameHeightWithSpacing() * 3.0f;
+    ImGui::BeginChild("##patchentries", ImVec2(0.0f, -below), true);
+    for (size_t i = 0; i < state.entries.size(); ++i) {
+        PatchEntry& entry = state.entries[i];
+        ImGui::BeginDisabled(entry.locked);
+        const std::string label = entry.name + "##patch" + std::to_string(i);
+        if (ImGui::Checkbox(label.c_str(), &entry.enabled)) {
+            state.dirty = true;
+            state.message.clear();
+        }
+        ImGui::EndDisabled();
+        if (!entry.note.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextUnformatted(entry.note.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    }
+    ImGui::EndChild();
+
+    const bool have_file = state.selected >= 0 && state.selected < static_cast<int>(state.files.size());
+    ImGui::BeginDisabled(!state.dirty || !have_file);
+    if (ImGui::Button("Save")) {
+        std::string error;
+        if (SavePatchEntries(state.files[static_cast<size_t>(state.selected)].path, state.entries,
+                             error)) {
+            state.dirty = false;
+            state.message = "Saved.";
+        } else {
+            state.message = error;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!state.dirty || !have_file);
+    if (ImGui::Button("Revert")) {
+        state.Select(state.selected);
+        state.message.clear();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!have_file);
+    if (ImGui::Button(state.confirm_delete ? "Really delete?" : "Delete file")) {
+        if (state.confirm_delete) {
+            std::string error;
+            const bool deleted = DeletePatchFile(state.files[static_cast<size_t>(state.selected)], error);
+            state.message = deleted ? "File deleted." : error;
+            state.Refresh();
+        } else {
+            state.confirm_delete = true;
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Rescan")) {
+        state.Refresh();
+        state.message.clear();
+    }
+    if (!state.message.empty()) {
+        ImGui::TextWrapped("%s", state.message.c_str());
+    }
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Folder: %s", state.dir.string().c_str());
+    ImGui::PopTextWrapPos();
+}
+
+} // namespace
+
+static bool ShowWindowImGui(Settings& s) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        ShowError(fmt::format("Cannot open the settings window ({}).\nEdit user/driveclub_pc.ini "
+                              "instead.",
+                              SDL_GetError()));
+        return false;
+    }
+    int window_w = 1240; // settings on the left, game patches on the right
+    int window_h = 940;
+    {
+        SDL_Rect usable{};
+        if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) && usable.w > 0 &&
+            usable.h > 0) {
+            window_w = std::min(window_w, std::max(480, usable.w - 40));
+            window_h = std::min(window_h, std::max(420, usable.h - 90));
+        }
+    }
+    SDL_InitSubSystem(SDL_INIT_GAMEPAD); // optional: lets a controller drive the window
+    SDL_Window* window =
+        SDL_CreateWindow("Driveclub-PC", window_w, window_h, SDL_WINDOW_RESIZABLE);
+    SDL_Renderer* renderer = window ? SDL_CreateRenderer(window, nullptr) : nullptr;
+    if (window == nullptr || renderer == nullptr) {
+        const std::string reason = SDL_GetError();
+        if (renderer != nullptr) {
+            SDL_DestroyRenderer(renderer);
+        }
+        if (window != nullptr) {
+            SDL_DestroyWindow(window);
+        }
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        ShowError(fmt::format("Cannot open the settings window ({}).\nEdit user/driveclub_pc.ini "
+                              "instead.",
+                              reason));
+        return false;
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr; // no imgui.ini in the working directory
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    ImFontConfig font_cfg;
+    font_cfg.OversampleH = 2;
+    font_cfg.OversampleV = 1;
+    io.FontDefault = ImGui::FontStack::AddPrimaryUiFont(
+        io.Fonts, 32.0f, EmulatorSettings.GetConsoleLanguage(), font_cfg, false);
+    io.FontGlobalScale = 0.5f;
+    const auto max_dim = SDL_GetNumberProperty(SDL_GetRendererProperties(renderer),
+                                               SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 8192);
+    const int atlas_max = static_cast<int>(std::bit_floor(std::max<u64>(max_dim, 512)));
+    io.Fonts->TexMaxWidth = atlas_max;
+    io.Fonts->TexMaxHeight = atlas_max;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.FrameRounding = 4.0f;
+    style.WindowRounding = 0.0f;
+    style.ItemSpacing = ImVec2(8.0f, 9.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer3_Init(renderer);
+
+    // ---- state -------------------------------------------------------------------------------
+    static FolderPick pick; // static: the SDL dialog may call back after this function returns
+    int pick_target = 0;    // 0 = game folder, 1 = firmware folder
+    bool pick_pending = false;
+
+    char game_buf[2048]{};
+    std::snprintf(game_buf, sizeof(game_buf), "%s", s.game_dir.c_str());
+    char save_buf[2048]{}; // optional save data root ("" = the emulator's own folder)
+    std::snprintf(save_buf, sizeof(save_buf), "%s", s.save_dir.c_str());
+    bool game_ok = false;
+    bool firmware_ok = false;
+    std::string game_msg;
+    std::string fw_msg;
+    std::string notice;
+
+    PatchPanelState patches;
+    patches.dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
+    std::string current_title_id(TitleId); // the region of the chosen game
+    const auto refresh = [&] {
+        const std::string dir = game_buf;
+        current_title_id = std::string(TitleId);
+        if (dir.empty()) {
+            game_ok = false;
+            game_msg = "Choose a Driveclub base game folder. Tested: CUSA00093 v1.28.";
+        } else {
+            std::string error;
+            const auto eboot = ResolveAndValidateGame(TextPath(dir), error);
+            game_ok = eboot.has_value();
+            current_title_id = ReadGameTitleId(TextPath(dir)).value_or(current_title_id);
+            game_msg = game_ok ? GameCompatibilityNote(current_title_id) : error;
+        }
+        fw_msg = FirmwareStatus(firmware_ok, current_title_id);
+        patches.title_ids = {current_title_id};
+        patches.Refresh();
+        std::replace(game_msg.begin(), game_msg.end(), '\n', ' ');
+        std::replace(fw_msg.begin(), fw_msg.end(), '\n', ' ');
+    };
+    refresh();
+
+    const auto [display_w, display_h] = DisplaySize();
+    const std::vector<std::pair<int, int>> resolutions = {
+        {0, 0},       {5120, 1440}, {3840, 2160}, {3440, 1440}, {2560, 1600}, {2560, 1440},
+        {2560, 1080}, {1920, 1200}, {1920, 1080}, {1600, 900},  {1280, 800}, {1280, 720}};
+    std::vector<std::string> res_items;
+    int res_i = 0;
+    for (size_t i = 0; i < resolutions.size(); ++i) {
+        const auto [w, h] = resolutions[i];
+        res_items.push_back(i == 0 ? fmt::format("Same as the display ({}x{})", display_w,
+                                                 display_h)
+                                   : fmt::format("{}x{}", w, h));
+        if (w == s.width && h == s.height) {
+            res_i = static_cast<int>(i);
+        }
+    }
+    const std::vector<std::string> fps_items = {"30 FPS (as on PS4)", "60 FPS (recommended)",
+                                                "60 FPS + FG (2x, ~120 output)",
+                                                "120 FPS (experimental)"};
+    const std::vector<std::string> display_items = {"Fullscreen (borderless)", "Window"};
+    const std::vector<std::string> render_items = {"1080p (native, fastest)",
+                                                   "1440p (sharper, about 10-15% slower)",
+                                                   "2160p (very demanding)"};
+    const std::vector<std::string> upscale_items = {"AMD FSR 1 (game image to window size)",
+                                                    "Bilinear"};
+    const std::vector<std::string> sharp_items = {"Off", "Normal (RCAS)", "Strong (RCAS)"};
+    const std::vector<std::string> af_items = {"Off (game setting)", "2x", "4x", "8x", "16x"};
+    const std::vector<std::string> aa_items = {"Off", "FXAA (default)", "SMAA 1x (High)"};
+    const std::vector<std::string> rb_items = {"Precise (default)",
+                                               "Relaxed (faster, shadow/vegetation glitches)",
+                                               "Off (fastest, effects may break)"};
+
+    int fps_i = s.target_fps == 30 ? 0 : s.target_fps == 120 ? 3 : s.frame_generation ? 2 : 1;
+    int display_i = s.fullscreen ? 0 : 1;
+    int render_i = s.render_res == 2160 ? 2 : s.render_res == 1440 ? 1 : 0;
+    int upscale_i = s.fsr ? 0 : 1;
+    int sharp_i = std::clamp(s.sharpening, 0, 2);
+    int af_i = s.af == 16 ? 4 : s.af == 8 ? 3 : s.af == 4 ? 2 : s.af == 2 ? 1 : 0;
+    int aa_i = std::clamp(s.aa, 0, 2);
+    int rb_i = 2 - std::clamp(s.readbacks, 0, 2);
+    bool pcore = s.pcore_pin;
+    bool async_shaders = s.async_shaders;
+    bool show_fps = s.show_fps;
+    bool deferred = s.deferred_recording;
+    bool classic = s.classic_vblank;
+    bool show_launcher = s.show_launcher;
+
+    constexpr float label_w = 170.0f;
+    const ImVec4 green(0.35f, 0.80f, 0.45f, 1.0f);
+    const ImVec4 red(0.95f, 0.40f, 0.40f, 1.0f);
+
+    const auto combo = [&](const char* label, const char* id, int& index,
+                           const std::vector<std::string>& items) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(label_w);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo(id, items[static_cast<size_t>(index)].c_str())) {
+            for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+                const bool selected = i == index;
+                if (ImGui::Selectable(items[static_cast<size_t>(i)].c_str(), selected)) {
+                    index = i;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    const auto check = [&](const char* label, bool& value) {
+        ImGui::SetCursorPosX(label_w);
+        ImGui::Checkbox(label, &value);
+    };
+    const auto status = [&](const std::string& message, bool ok) {
+        ImGui::Indent(label_w);
+        ImGui::PushStyleColor(ImGuiCol_Text, ok ? green : red);
+        ImGui::TextWrapped("%s", message.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Unindent(label_w);
+    };
+    const auto start_pick = [&](int target) {
+        pick_target = target;
+        pick_pending = true;
+        {
+            std::lock_guard lock{pick.mutex};
+            pick.finished = false;
+            pick.has_path = false;
+            pick.path.clear();
+        }
+        SDL_ShowOpenFolderDialog(OnFolderPicked, &pick, window, nullptr, false);
+    };
+
+    // ---- main loop ---------------------------------------------------------------------------
+    bool done = false;
+    bool play = false;
+    while (!done) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL3_ProcessEvent(&event);
+            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                done = true;
+            }
+        }
+
+        if (pick_pending) {
+            bool finished = false;
+            bool has_path = false;
+            std::string picked;
+            {
+                std::lock_guard lock{pick.mutex};
+                finished = pick.finished;
+                has_path = pick.has_path;
+                picked = pick.path;
+            }
+            if (finished) {
+                pick_pending = false;
+                if (has_path) {
+                    if (pick_target == 0) {
+                        std::snprintf(game_buf, sizeof(game_buf), "%s", picked.c_str());
+                        notice.clear();
+                    } else if (pick_target == 2) {
+                        std::snprintf(save_buf, sizeof(save_buf), "%s", picked.c_str());
+                    } else {
+                        notice = ImportFirmwareFrom(picked);
+                    }
+                    refresh();
+                }
+            }
+        }
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(viewport->WorkPos);
+        ImGui::SetNextWindowSize(viewport->WorkSize);
+        ImGui::Begin("Driveclub-PC", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoSavedSettings);
+
+        ImGui::TextUnformatted("Driveclub-PC settings");
+        ImGui::Separator();
+        const float footer_h = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.y * 2.0f +
+                               ImGui::GetStyle().WindowPadding.y;
+        const float left_w = std::max(480.0f, ImGui::GetContentRegionAvail().x * 0.54f);
+        ImGui::BeginChild("##settings", ImVec2(left_w, -footer_h), false);
+        ImGui::Spacing();
+
+        // Game folder
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Game folder");
+        ImGui::SameLine(label_w);
+        ImGui::SetNextItemWidth(-110.0f);
+        ImGui::InputText("##game", game_buf, sizeof(game_buf));
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            refresh();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(pick_pending);
+        if (ImGui::Button("Browse...##game")) {
+            start_pick(0);
+        }
+        ImGui::EndDisabled();
+        status(game_msg, game_ok);
+        ImGui::Spacing();
+
+        // Save data folder (optional)
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Save folder");
+        ImGui::SameLine(label_w);
+        ImGui::SetNextItemWidth(-110.0f);
+        ImGui::InputText("##save", save_buf, sizeof(save_buf));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(pick_pending);
+        if (ImGui::Button("Browse...##save")) {
+            start_pick(2);
+        }
+        ImGui::EndDisabled();
+        {
+            Settings preview;
+            preview.save_dir = save_buf;
+            ImGui::Indent(label_w);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("Saves go to: %s", PathText(SaveRoot(preview)).c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Unindent(label_w);
+        }
+        ImGui::Spacing();
+
+        // Firmware
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Firmware");
+        ImGui::SameLine(label_w);
+        ImGui::BeginDisabled(pick_pending);
+        if (ImGui::Button("Import...##fw")) {
+            start_pick(1);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Details##fw")) {
+            notice = InspectSysModules(current_title_id).details;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(folder with your PS4 *.sprx modules)");
+        status(fw_msg, firmware_ok);
+        if (!notice.empty()) {
+            ImGui::Indent(label_w);
+            ImGui::TextWrapped("%s", notice.c_str());
+            ImGui::Unindent(label_w);
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        combo("Frame rate", "##fps", fps_i, fps_items);
+        combo("Display", "##display", display_i, display_items);
+        ImGui::BeginDisabled(display_i == 0); // the window size only applies in windowed mode
+        combo("Window size", "##resolution", res_i, res_items);
+        ImGui::EndDisabled();
+        combo("Render resolution", "##render", render_i, render_items);
+        combo("Upscaling", "##upscale", upscale_i, upscale_items);
+        combo("Sharpening", "##sharp", sharp_i, sharp_items);
+        combo("Anisotropic filter", "##af", af_i, af_items);
+        combo("Anti-aliasing", "##aa", aa_i, aa_items);
+        combo("GPU readbacks", "##readbacks", rb_i, rb_items);
+        ImGui::Spacing();
+
+        check("Prefer performance cores (hybrid CPUs)", pcore);
+        check("Compile shaders in the background (less stutter)", async_shaders);
+        check("Show FPS counter", show_fps);
+        check("Experimental: record Vulkan commands on a second thread", deferred);
+        check("Classic PS4 frame pacing (fallback if timing looks wrong)", classic);
+        check("Show this window at start", show_launcher);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        ImGui::BeginChild("##patches", ImVec2(0.0f, -footer_h), false);
+        DrawPatchPanel(patches);
+        ImGui::EndChild();
+        ImGui::Separator();
+        ImGui::SetCursorPosX(label_w);
+        ImGui::BeginDisabled(!(game_ok && firmware_ok));
+        if (ImGui::Button("Play", ImVec2(120.0f, 0.0f))) {
+            if (patches.dirty && patches.selected >= 0 &&
+                patches.selected < static_cast<int>(patches.files.size())) {
+                std::string patch_error; // unsaved patch choices are saved when the game starts
+                SavePatchEntries(patches.files[static_cast<size_t>(patches.selected)].path,
+                                 patches.entries, patch_error);
+            }
+            play = true;
+            done = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Quit", ImVec2(120.0f, 0.0f))) {
+            done = true;
+        }
+
+        ImGui::End();
+        ImGui::Render();
+        SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
+        SDL_RenderClear(renderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+        SDL_RenderPresent(renderer);
+    }
+
+    // ---- collect the choices (also when the window is closed, so the ini keeps them) --------
+    s.game_dir = game_buf;
+    static constexpr int fps_values[] = {30, 60, 60, 120};
+    const int frame_mode = std::clamp(fps_i, 0, 3);
+    s.target_fps = fps_values[frame_mode];
+    s.frame_generation = frame_mode == 2;
+    s.save_dir = save_buf;
+    s.fullscreen = display_i == 0;
+    const auto [chosen_w, chosen_h] = resolutions[static_cast<size_t>(res_i)];
+    s.width = chosen_w;
+    s.height = chosen_h;
+    s.fsr = upscale_i == 0;
+    s.sharpening = std::clamp(sharp_i, 0, 2);
+    s.readbacks = 2 - std::clamp(rb_i, 0, 2);
+    static constexpr int af_values[] = {0, 2, 4, 8, 16};
+    s.af = af_values[std::clamp(af_i, 0, 4)];
+    s.aa = std::clamp(aa_i, 0, 2);
+    static constexpr int render_values[] = {1080, 1440, 2160};
+    s.render_res = render_values[std::clamp(render_i, 0, 2)];
+    s.pcore_pin = pcore;
+    s.async_shaders = async_shaders;
+    s.show_fps = show_fps;
+    s.deferred_recording = deferred;
+    s.classic_vblank = classic;
+    s.show_launcher = show_launcher;
+
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    return play;
+}
+
+#endif // !_WIN32
+
 std::optional<fs::path> Run() {
     Settings s = Load();
     std::string error;
@@ -1015,9 +1842,16 @@ std::optional<fs::path> Run() {
         }
     }
 #else
-    if (!game_ok || !firmware_ok) {
-        ShowError(error.empty() ? std::string("Set game_dir in user/driveclub_pc.ini") : error);
-        return std::nullopt;
+    // Patches shipped inside the AppImage are copied to the user's patches folder once.
+    SeedBundledPatches(BundledPatchesDir(),
+                       Common::FS::GetUserPath(Common::FS::PathType::PatchesDir));
+    // driveclub-pc (linux): DCPC_LAUNCHER=1 opens the window even when it is turned off.
+    if (s.show_launcher || !game_ok || !firmware_ok || std::getenv("DCPC_LAUNCHER") != nullptr) {
+        const bool play = ShowWindowImGui(s);
+        Save(s);
+        if (!play) {
+            return std::nullopt;
+        }
     }
 #endif
     if (!PrepareSaveRoot(s, error)) {
